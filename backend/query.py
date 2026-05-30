@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 from database import get_db
 from models import User, UploadedFile, QueryHistory
 import jwt
@@ -14,6 +15,10 @@ JWT_SECRET = os.getenv("JWT_SECRET", "test-secret-key")
 ALGORITHM = "HS256"
 
 client = Anthropic()
+
+class QueryRequest(BaseModel):
+    file_id: str
+    question: str
 
 def get_current_user(authorization: str = Header(None), db: Session = Depends(get_db)):
     if not authorization:
@@ -75,7 +80,6 @@ def execute_query(csv_data: str, sql: str) -> dict:
     conn = sqlite3.connect(':memory:')
     cursor = conn.cursor()
     
-    # Create temp table from CSV
     import csv
     reader = csv.DictReader(io.StringIO(csv_data))
     rows = list(reader)
@@ -115,31 +119,25 @@ def execute_query(csv_data: str, sql: str) -> dict:
 
 @router.post("/ask")
 def ask_question(
-    file_id: str,
-    question: str,
+    request: QueryRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    # Get file
     file = db.query(UploadedFile).filter(
-        UploadedFile.id == file_id,
+        UploadedFile.id == request.file_id,
         UploadedFile.user_id == user.id
     ).first()
     
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
     
-    # Get schema
     schema = get_csv_schema(file.csv_data)
     
-    # Get sample rows
     sample_lines = file.csv_data.split('\n')[:4]
     sample_rows = '\n'.join(sample_lines)
     
-    # Build prompt
-    prompt = build_prompt(schema, question, sample_rows)
+    prompt = build_prompt(schema, request.question, sample_rows)
     
-    # Call Claude
     try:
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
@@ -151,18 +149,15 @@ def ask_question(
         
         generated_sql = message.content[0].text.strip()
         
-        # Validate
         if not validate_sql(generated_sql):
             raise HTTPException(status_code=400, detail="Generated SQL contains unsafe operations")
         
-        # Execute
         result = execute_query(file.csv_data, generated_sql)
         
-        # Save to history
         history = QueryHistory(
             user_id=user.id,
-            file_id=file_id,
-            question=question,
+            file_id=request.file_id,
+            question=request.question,
             generated_sql=generated_sql,
             results=json.dumps(result)
         )
@@ -170,7 +165,7 @@ def ask_question(
         db.commit()
         
         return {
-            "question": question,
+            "question": request.question,
             "sql": generated_sql,
             "data": result,
             "row_count": result["count"]
